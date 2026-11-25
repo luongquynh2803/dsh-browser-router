@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /**
- * Browser-Router MCP server (stdio).
+ * Browser-Router MCP server (stdio) — v0.2.0.
  * Expose namespace `browse.*` cho dsh qua dsh-mcp-client.
  *
  * Env:
  *   CHROME_CDP              CDP endpoint của Chrome (mặc định http://127.0.0.1:9222)
- *   BROWSER_ROUTER_CONFIG   đường dẫn browser-router.yaml (mặc định: dùng DEFAULT_CONFIG)
+ *   BROWSER_ROUTER_CONFIG   đường dẫn browser-router.yaml (mặc định: DEFAULT_CONFIG)
+ *   CHROME_LOCK_PATH        lockdir dùng chung giữa các tiến trình trên cùng Chrome CDP
+ *   DOWNLOAD_DIR            thư mục lưu file tải về khi dùng browse_download
+ *   APPROVAL_DB_PATH        SQLite DB để kiểm approval_id cho thao tác mutation
  */
 import { resolve } from "node:path";
-import { createPageProvider, PlaywrightBackend, CuaBackend, type PageProvider } from "./backends.js";
+import { createSqliteApprovalVerifier } from "./approval.js";
+import { createPageProvider, CuaBackend, PlaywrightBackend, type PageProvider } from "./backends.js";
+import { DEFAULT_CONFIG, loadRouterConfig } from "./config.js";
 import { BrowserRouter } from "./router.js";
-import { loadRouterConfig, DEFAULT_CONFIG } from "./config.js";
 import type { BrowserActionName, BrowserResult } from "./types.js";
 
 interface ToolDef {
@@ -24,7 +28,7 @@ interface ToolDef {
 const TOOLS: ToolDef[] = [
   {
     name: "browse_navigate",
-    description: "Mở URL trong browser của bot.",
+    description: "Mở URL trong tab tạm cô lập của browser (không đè tab nền).",
     inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
     action: "navigate",
     toParams: (args) => ({ url: args.url }),
@@ -39,21 +43,30 @@ const TOOLS: ToolDef[] = [
   {
     name: "browse_click",
     description:
-      "Bấm phần tử theo ref từ snapshot (r-<n>), hoặc toạ độ dạng '@x,y' (chỉ dùng ở CUA khi không có ref).",
-    inputSchema: { type: "object", properties: { ref: { type: "string" } }, required: ["ref"] },
+      "Bấm phần tử theo ref (r-<n>) hoặc '@x,y'. Ở chế độ read_only/mutation-gate bắt buộc truyền approval_id đã duyệt.",
+    inputSchema: {
+      type: "object",
+      properties: { ref: { type: "string" }, approval_id: { type: "string" } },
+      required: ["ref"],
+    },
     action: "click",
-    toParams: (args) => ({ ref: args.ref }),
+    toParams: (args) => ({ ref: args.ref, approval_id: args.approval_id }),
   },
   {
     name: "browse_type",
-    description: "Gõ text vào phần tử theo ref (r-<n>) hoặc toạ độ '@x,y'.",
+    description:
+      "Gõ text vào phần tử theo ref (r-<n>) hoặc '@x,y'. Ở chế độ read_only/mutation-gate bắt buộc truyền approval_id đã duyệt.",
     inputSchema: {
       type: "object",
-      properties: { ref: { type: "string" }, text: { type: "string" } },
+      properties: {
+        ref: { type: "string" },
+        text: { type: "string" },
+        approval_id: { type: "string" },
+      },
       required: ["ref", "text"],
     },
     action: "type",
-    toParams: (args) => ({ ref: args.ref, text: args.text }),
+    toParams: (args) => ({ ref: args.ref, text: args.text, approval_id: args.approval_id }),
   },
   {
     name: "browse_extract",
@@ -95,10 +108,34 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "browse_submit",
-    description:
-      "Nộp form hiện tại (Enter). Bị chặn bởi require_approval_submit: trả needs_human thay vì tự động thực hiện.",
-    inputSchema: { type: "object", properties: {} },
+    description: "Nộp form hiện tại (Enter). Cần approval_id hợp lệ khi bật require_approval_submit.",
+    inputSchema: {
+      type: "object",
+      properties: { approval_id: { type: "string" } },
+    },
     action: "submit",
+    toParams: (args) => ({ approval_id: args.approval_id }),
+  },
+  {
+    name: "browse_download",
+    description: "Bấm nút Download/Export theo ref (r-<n>) và chờ file tải xong vào thư mục raw, trả path + sha256.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ref: { type: "string" },
+        download_dir: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["ref"],
+    },
+    action: "download",
+    toParams: (args) => ({ ref: args.ref, download_dir: args.download_dir, timeout_ms: args.timeout_ms }),
+  },
+  {
+    name: "browse_close_tab",
+    description: "Đóng ngay tab làm việc tạm của router (giữ nguyên mọi tab nền được bảo vệ).",
+    inputSchema: { type: "object", properties: {} },
+    action: "close_tab",
     toParams: () => ({}),
   },
 ];
@@ -110,12 +147,31 @@ function getRouter(): BrowserRouter {
   if (router) return router;
   const configPath = process.env.BROWSER_ROUTER_CONFIG;
   const config = configPath ? loadRouterConfig(resolve(configPath)) : structuredClone(DEFAULT_CONFIG);
+
+  if (process.env.CHROME_LOCK_PATH) config.lock_path = process.env.CHROME_LOCK_PATH;
+  if (process.env.DOWNLOAD_DIR) config.download_dir = process.env.DOWNLOAD_DIR;
+  if (process.env.APPROVAL_DB_PATH) config.approval_db_path = process.env.APPROVAL_DB_PATH;
+
   const endpoint = process.env.CHROME_CDP ?? "http://127.0.0.1:9222";
-  pageProvider = createPageProvider(endpoint);
-  router = new BrowserRouter(config, {
-    playwright: new PlaywrightBackend(pageProvider),
-    cua: new CuaBackend(pageProvider),
+  pageProvider = createPageProvider(endpoint, {
+    isolatedTab: config.isolated_tab,
+    protectedHosts: config.protected_hosts,
+    idleTabCloseMs: config.idle_tab_close_ms,
   });
+
+  const approvalVerifier = config.approval_db_path
+    ? createSqliteApprovalVerifier(resolve(config.approval_db_path))
+    : undefined;
+
+  router = new BrowserRouter(
+    config,
+    {
+      playwright: new PlaywrightBackend(pageProvider, { forbiddenMarkers: config.forbidden_page_markers }),
+      cua: new CuaBackend(pageProvider, { forbiddenMarkers: config.forbidden_page_markers }),
+    },
+    undefined,
+    { approvalVerifier },
+  );
   return router;
 }
 
@@ -127,7 +183,6 @@ function toolByName(name: string): ToolDef | undefined {
   return TOOLS.find((t) => t.name === name);
 }
 
-/** Tách ảnh base64 khỏi JSON text → block type:"image" chuẩn MCP (không nhét Base64 vào text). */
 function splitResult(result: BrowserResult): { text: string; image?: string } {
   const content = result.content as { image?: unknown } | null | undefined;
   const image = typeof content?.image === "string" ? content.image : undefined;
@@ -154,7 +209,7 @@ async function handle(request: {
         result: {
           protocolVersion: requested,
           capabilities: { tools: {} },
-          serverInfo: { name: "browser-router", version: "0.1.0" },
+          serverInfo: { name: "browser-router", version: "0.2.0" },
         },
       });
       return;
@@ -216,7 +271,6 @@ process.stdin.on("data", (chunk: string) => {
     } catch {
       continue;
     }
-    // Tuần tự hóa request (không chạy chồng lên nhau trên cùng 1 tab Chrome).
     queue = queue.then(() => handle(parsed)).catch(() => {
       /* lỗi đã bắn trong handle */
     });

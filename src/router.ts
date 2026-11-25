@@ -1,5 +1,7 @@
 import { matchRule, validateNavigateUrl } from "./config.js";
+import type { ApprovalVerifier } from "./approval.js";
 import type { BrowserBackend } from "./backends.js";
+import { withChromeLock } from "./lock.js";
 import type {
   BackendKind,
   BrowserActionName,
@@ -8,12 +10,14 @@ import type {
   RouterConfig,
 } from "./types.js";
 
-type Dispatch = (backend: BrowserBackend, params: BrowserActionParams) => Promise<BrowserResult>;
+type Dispatch = (backend: BrowserBackend, params: BrowserActionParams, config: RouterConfig) => Promise<BrowserResult>;
 
 function required(value: string | undefined, field: string): string {
   if (!value) throw new Error(`thiếu tham số: ${field}`);
   return value;
 }
+
+const MUTATION_ACTIONS = new Set<BrowserActionName>(["click", "type", "submit"]);
 
 const dispatch: Record<BrowserActionName, Dispatch> = {
   navigate: (backend, params) => backend.navigate(required(params.url, "url")),
@@ -26,16 +30,50 @@ const dispatch: Record<BrowserActionName, Dispatch> = {
   go_back: (backend) => backend.goBack(),
   refresh: (backend) => backend.refresh(),
   submit: (backend) => backend.submit(),
+  download: (backend, params, config) => {
+    if (!backend.download) {
+      return Promise.resolve({
+        ok: false,
+        action: "download",
+        backend: backend.kind,
+        switched: false,
+        status: "error",
+        hint: "backend không hỗ trợ download",
+      });
+    }
+    const dir = params.download_dir ?? config.download_dir;
+    if (!dir) {
+      return Promise.resolve({
+        ok: false,
+        action: "download",
+        backend: backend.kind,
+        switched: false,
+        status: "error",
+        hint: "thiếu download_dir (truyền tham số hoặc cấu hình download_dir / DOWNLOAD_DIR)",
+      });
+    }
+    return backend.download(required(params.ref, "ref"), dir, params.timeout_ms);
+  },
+  close_tab: (backend) => {
+    if (!backend.closeTab) {
+      return Promise.resolve({
+        ok: true,
+        action: "close_tab",
+        backend: backend.kind,
+        switched: false,
+        status: "ok",
+        content: { closed: false },
+      });
+    }
+    return backend.closeTab();
+  },
 };
 
 export interface BrowserRouterState {
   backend: BackendKind;
   cuaSteps: number;
-  /** Số lần escalate cho từng domain — anti-flap: >= 2 thì ghim CUA. */
   escalateCount: Record<string, number>;
-  /** Token ảnh ước lượng đã dùng (base64 length / 3 ≈ tokens). */
   cuaTokensUsed: number;
-  /** Domain hiện tại (cập nhật khi navigate) — dùng cho probe/anti-flap. */
   currentDomain: string;
 }
 
@@ -50,11 +88,13 @@ function domainOf(value: string): string {
 
 export class BrowserRouter {
   private readonly state: BrowserRouterState;
+  private readonly approvalVerifier?: ApprovalVerifier;
 
   constructor(
     private readonly config: RouterConfig,
     private readonly backends: Record<BackendKind, BrowserBackend>,
     state?: BrowserRouterState,
+    options: { approvalVerifier?: ApprovalVerifier } = {},
   ) {
     this.state = state ?? {
       backend: config.default_backend,
@@ -63,6 +103,7 @@ export class BrowserRouter {
       cuaTokensUsed: 0,
       currentDomain: "",
     };
+    this.approvalVerifier = options.approvalVerifier;
   }
 
   get currentBackend(): BackendKind {
@@ -99,7 +140,6 @@ export class BrowserRouter {
     return { ok: false, action, backend, switched: false, status: "needs_human", hint: reason };
   }
 
-  /** Ước lượng token ảnh: 1 token ≈ 3 ký tự base64. */
   private countCuaTokens(result: BrowserResult): void {
     const content = result.content as { image?: unknown } | null | undefined;
     const image = content?.image;
@@ -108,21 +148,38 @@ export class BrowserRouter {
     }
   }
 
+  private isMutationApproved(approvalId: string | undefined): boolean {
+    if (!approvalId || !approvalId.trim()) return false;
+    if (!this.approvalVerifier) return false;
+    return this.approvalVerifier(approvalId.trim());
+  }
+
   async execute(action: BrowserActionName, params: BrowserActionParams = {}): Promise<BrowserResult> {
-    // 0. Submit cần phê duyệt con người (chốt chặn rõ ràng).
-    if (action === "submit" && this.config.require_approval_submit) {
-      return this.needsHuman(
-        action,
-        this.state.backend,
-        "thao tác submit (gửi form/thanh toán/xoá) cần phê duyệt con người — không tự động thực hiện",
-      );
+    // 0a. Mutation Approval Gate (v0.2.0: chặn click/type/submit ở chế độ read_only hoặc require_approval_mutation)
+    if (MUTATION_ACTIONS.has(action)) {
+      const mutationGated = this.config.read_only || this.config.require_approval_mutation;
+      if (mutationGated && !this.isMutationApproved(params.approval_id)) {
+        return this.needsHuman(
+          action,
+          this.state.backend,
+          `thao tác "${action}" bị chặn bởi chính sách read_only/approval gate — cần approval_id đã được duyệt hợp lệ`,
+        );
+      }
+      if (action === "submit" && this.config.require_approval_submit && !this.isMutationApproved(params.approval_id)) {
+        return this.needsHuman(
+          action,
+          this.state.backend,
+          "thao tác submit (gửi form/thanh toán/xoá) cần phê duyệt con người — không tự động thực hiện",
+        );
+      }
     }
 
-    // 0b. Chặn sớm giao thức nguy hiểm (file://, javascript:, chrome://) và SSRF nội bộ trước khi chạm Chrome/escalate.
+    // 0b. Chặn sớm giao thức nguy hiểm, SSRF nội bộ, và domain ngoài allowed_domains
     if (action === "navigate" && params.url !== undefined) {
       const check = validateNavigateUrl(params.url, {
         allowPrivateNetwork: this.config.allow_private_network,
         allowDataUrls: this.config.allow_data_urls,
+        allowedDomains: this.config.allowed_domains,
       });
       if (!check.ok) {
         return {
@@ -137,7 +194,10 @@ export class BrowserRouter {
       }
     }
 
-    // 1. Chọn backend (domain-map chỉ cho navigate; còn lại giữ backend hiện tại).
+    return withChromeLock(this.config.lock_path, () => this.executeUnlocked(action, params));
+  }
+
+  private async executeUnlocked(action: BrowserActionName, params: BrowserActionParams): Promise<BrowserResult> {
     let backend: BackendKind = this.state.backend;
     if (action === "navigate" && params.url) {
       backend = matchRule(params.url, this.config.rules) ?? this.config.default_backend;
@@ -145,12 +205,11 @@ export class BrowserRouter {
     }
     if (backend === "cua" && this.overBudget()) return this.budgetResult(action, backend);
 
-    // 2. Chạy.
-    let result = await dispatch[action](this.backends[backend], params);
+    let result = await dispatch[action](this.backends[backend], params, this.config);
     const landedDomain = domainOf(result.url ?? "");
     if (landedDomain) this.state.currentDomain = landedDomain;
 
-    // 3. CAPTCHA → dừng, cần con người (KHÔNG tự click mò để tránh khóa tài khoản).
+    // CAPTCHA / OTP / Account mismatch → dừng, cần con người
     if (result.status === "captcha") {
       return this.needsHuman(
         action,
@@ -158,18 +217,28 @@ export class BrowserRouter {
         "gặp CAPTCHA — cần con người giải trên profile Chrome rồi resume; không tự động click",
       );
     }
+    if (result.status === "needs_human") {
+      return result;
+    }
+    if (result.status === "login_required" && this.config.stop_on_login) {
+      return this.needsHuman(
+        action,
+        backend,
+        result.hint ?? "phiên bị đăng xuất — dừng và báo người dùng (stop_on_login=true), không tự đăng nhập",
+      );
+    }
 
     let finalBackend: BackendKind = backend;
 
-    // 4. Escalation: Playwright gặp tín hiệu xấu → chạy lại bằng CUA.
     const shouldEscalate =
       backend === "playwright" &&
+      action !== "close_tab" &&
       this.config.escalation.enabled &&
       this.config.escalation.signals.includes(result.status);
 
     if (shouldEscalate) {
       if (this.overBudget()) return this.budgetResult(action, backend);
-      result = await dispatch[action](this.backends.cua, params);
+      result = await dispatch[action](this.backends.cua, params, this.config);
       const escalatedDomain = domainOf(result.url ?? "");
       if (escalatedDomain) this.state.currentDomain = escalatedDomain;
       this.countCuaTokens(result);
@@ -185,6 +254,7 @@ export class BrowserRouter {
           "gặp CAPTCHA — cần con người giải trên profile Chrome rồi resume; không tự động click",
         );
       }
+      if (result.status === "needs_human") return result;
     } else if (backend === "cua") {
       this.countCuaTokens(result);
       this.state.cuaSteps += 1;
@@ -192,9 +262,6 @@ export class BrowserRouter {
 
     this.state.backend = finalBackend;
 
-    // 5. Probe-downgrade: chỉ ở lượt CUA SAU lượt escalate (KHÔNG ngay lượt escalate —
-    // lúc đó trang vẫn đang ở trạng thái xấu), và chỉ cho domain đã từng escalate
-    // (domain-map chọn CUA sẵn thì tôn trọng rule). Anti-flap: escalateCount >= 2 → ghim CUA.
     if (
       finalBackend === "cua" &&
       result.ok &&
@@ -218,7 +285,6 @@ export class BrowserRouter {
     return result;
   }
 
-  /** Dùng ngoài luồng execute khi cần ép hạ thang (vd: sau khi người giải CAPTCHA). */
   async probeDowngrade(): Promise<BrowserResult | null> {
     if (this.state.backend !== "cua") return null;
     const probe = await this.backends.playwright.snapshot();
