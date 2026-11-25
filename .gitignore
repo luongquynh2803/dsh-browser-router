@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.dsh/
+browser-router.mcp.yml
+.env
+.env.*
+*.log
+.DS_Store

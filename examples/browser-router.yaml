@@ -1,0 +1,19 @@
+# Domain-map mẫu cho Browser-Router (chế độ B)
+# Dùng bởi MCP server: BROWSER_ROUTER_CONFIG=examples/browser-router.yaml
+browser:
+  default_backend: playwright
+  rules:
+    - match: "*.amazon.com"
+      backend: playwright
+    - match: "*.linkedin.com"
+      backend: cua
+    - match: "*.cloudflare.com"
+      backend: cua
+    - match: "*.google.com/recaptcha*"
+      backend: cua
+  escalation:
+    enabled: true
+    signals: [blocked, login_required, empty, locator_not_found, timeout]
+  cost_guard:
+    max_cua_steps: 8
+    max_cua_budget_tokens: 20000
