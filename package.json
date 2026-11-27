@@ -1,7 +1,7 @@
 {
   "name": "dsh-browser-router",
-  "version": "0.1.0",
-  "description": "Smart MCP Browser Router: Playwright DOM-first with automatic Vision/CUA escalation, cost guard, SSRF protection, and human-in-the-loop approval gates.",
+  "version": "0.2.0",
+  "description": "Smart MCP Browser Router: Playwright DOM-first with automatic Vision/CUA escalation, isolated tabs, shared CDP lock, domain allowlist, read-only mutation approval gates, and download support.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/config.test.ts tests/router.test.ts tests/integration.test.ts",
+    "test": "tsx --test tests/config.test.ts tests/router.test.ts tests/integration.test.ts tests/v02-safety.test.ts",
     "start": "tsx src/mcp.ts",
     "wire": "tsx scripts/wire-browser-router.ts --port 9222 --config examples/browser-router.yaml",
     "smoke:browser": "bash scripts/smoke-browser.sh"

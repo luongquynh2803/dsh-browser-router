@@ -17,6 +17,14 @@ export const DEFAULT_CONFIG: RouterConfig = {
   require_approval_submit: true,
   allow_private_network: false,
   allow_data_urls: false,
+  allowed_domains: [],
+  protected_hosts: [],
+  isolated_tab: true,
+  idle_tab_close_ms: 0,
+  read_only: false,
+  require_approval_mutation: false,
+  stop_on_login: false,
+  forbidden_page_markers: [],
 };
 
 function assertBackend(value: unknown): asserts value is BackendKind {
@@ -30,6 +38,21 @@ function asRecord(value: unknown, field: string): Record<string, unknown> {
     throw new RouterConfigError(`${field} phải là object`);
   }
   return value as Record<string, unknown>;
+}
+
+function parseStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw new RouterConfigError(`${field} phải là mảng chuỗi`);
+  return value.map((item, idx) => {
+    if (typeof item !== "string" || item.trim() === "") {
+      throw new RouterConfigError(`${field}[${idx}] phải là chuỗi không rỗng`);
+    }
+    return item.trim();
+  });
+}
+
+function parseBoolField(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") throw new RouterConfigError(`${field} phải là boolean`);
+  return value;
 }
 
 export function parseRouterConfig(raw: unknown): RouterConfig {
@@ -77,22 +100,49 @@ export function parseRouterConfig(raw: unknown): RouterConfig {
     }
   }
   if (browser.require_approval_submit !== undefined) {
-    if (typeof browser.require_approval_submit !== "boolean") {
-      throw new RouterConfigError("require_approval_submit phải là boolean");
-    }
-    config.require_approval_submit = browser.require_approval_submit;
+    config.require_approval_submit = parseBoolField(browser.require_approval_submit, "require_approval_submit");
   }
   if (browser.allow_private_network !== undefined) {
-    if (typeof browser.allow_private_network !== "boolean") {
-      throw new RouterConfigError("allow_private_network phải là boolean");
-    }
-    config.allow_private_network = browser.allow_private_network;
+    config.allow_private_network = parseBoolField(browser.allow_private_network, "allow_private_network");
   }
   if (browser.allow_data_urls !== undefined) {
-    if (typeof browser.allow_data_urls !== "boolean") {
-      throw new RouterConfigError("allow_data_urls phải là boolean");
+    config.allow_data_urls = parseBoolField(browser.allow_data_urls, "allow_data_urls");
+  }
+  if (browser.allowed_domains !== undefined) {
+    config.allowed_domains = parseStringArray(browser.allowed_domains, "allowed_domains");
+  }
+  if (browser.protected_hosts !== undefined) {
+    config.protected_hosts = parseStringArray(browser.protected_hosts, "protected_hosts");
+  }
+  if (browser.isolated_tab !== undefined) {
+    config.isolated_tab = parseBoolField(browser.isolated_tab, "isolated_tab");
+  }
+  if (browser.idle_tab_close_ms !== undefined) {
+    if (typeof browser.idle_tab_close_ms !== "number" || browser.idle_tab_close_ms < 0) {
+      throw new RouterConfigError("idle_tab_close_ms phải là số >= 0");
     }
-    config.allow_data_urls = browser.allow_data_urls;
+    config.idle_tab_close_ms = browser.idle_tab_close_ms;
+  }
+  if (browser.read_only !== undefined) {
+    config.read_only = parseBoolField(browser.read_only, "read_only");
+  }
+  if (browser.require_approval_mutation !== undefined) {
+    config.require_approval_mutation = parseBoolField(browser.require_approval_mutation, "require_approval_mutation");
+  }
+  if (browser.stop_on_login !== undefined) {
+    config.stop_on_login = parseBoolField(browser.stop_on_login, "stop_on_login");
+  }
+  if (browser.forbidden_page_markers !== undefined) {
+    config.forbidden_page_markers = parseStringArray(browser.forbidden_page_markers, "forbidden_page_markers");
+  }
+  if (typeof browser.download_dir === "string" && browser.download_dir.trim()) {
+    config.download_dir = browser.download_dir.trim();
+  }
+  if (typeof browser.lock_path === "string" && browser.lock_path.trim()) {
+    config.lock_path = browser.lock_path.trim();
+  }
+  if (typeof browser.approval_db_path === "string" && browser.approval_db_path.trim()) {
+    config.approval_db_path = browser.approval_db_path.trim();
   }
   return config;
 }
@@ -131,13 +181,21 @@ export function isPrivateOrLoopbackHost(rawHostname: string): boolean {
   const ipVer = isIP(host);
   if (ipVer === 4) return isPrivateIpv4(host);
   if (ipVer === 6) {
-    if (host === "::1" || host === "::" || host.startsWith("fe8") || host.startsWith("fe9") || host.startsWith("fea") || host.startsWith("feb") || host.startsWith("fc") || host.startsWith("fd")) {
+    if (
+      host === "::1" ||
+      host === "::" ||
+      host.startsWith("fe8") ||
+      host.startsWith("fe9") ||
+      host.startsWith("fea") ||
+      host.startsWith("feb") ||
+      host.startsWith("fc") ||
+      host.startsWith("fd")
+    ) {
       return true;
     }
     if (host.startsWith("::ffff:")) {
       const tail = host.slice("::ffff:".length);
       if (isIP(tail) === 4) return isPrivateIpv4(tail);
-      // WHATWG URL chuẩn hoá ::ffff:127.0.0.1 → ::ffff:7f00:1 (2 nhóm hex 16-bit).
       const hexMatch = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
       if (hexMatch) {
         const hi = Number.parseInt(hexMatch[1]!, 16);
@@ -149,39 +207,6 @@ export function isPrivateOrLoopbackHost(rawHostname: string): boolean {
     }
   }
   return false;
-}
-
-/**
- * Kiểm tra an toàn URL trước khi navigate: chỉ cho phép http/https (hoặc data: khi bật cấu hình),
- * chặn file://, chrome://, javascript: và chặn địa chỉ loopback/nội bộ (chống SSRF/đọc CDP).
- */
-export function validateNavigateUrl(
-  rawUrl: string,
-  options: { allowPrivateNetwork?: boolean; allowDataUrls?: boolean } = {},
-): { ok: true } | { ok: false; reason: string } {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    return { ok: false, reason: `URL không hợp lệ: "${rawUrl}"` };
-  }
-  if (parsed.protocol === "data:") {
-    if (options.allowDataUrls) return { ok: true };
-    return { ok: false, reason: "giao thức data: bị chặn theo mặc định" };
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return {
-      ok: false,
-      reason: `giao thức "${parsed.protocol}" bị chặn (chỉ cho phép http: hoặc https:)`,
-    };
-  }
-  if (!options.allowPrivateNetwork && isPrivateOrLoopbackHost(parsed.hostname)) {
-    return {
-      ok: false,
-      reason: `địa chỉ nội bộ/loopback "${parsed.hostname}" bị chặn bởi chính sách chống SSRF`,
-    };
-  }
-  return { ok: true };
 }
 
 function escapeRegex(value: string): string {
@@ -230,13 +255,58 @@ function matchSingleRule(parsed: URL, rawPattern: string): boolean {
     expectedPort = hostPort.slice(colonIdx + 1);
   }
   if (expectedPort !== undefined) {
-    const effectivePort = parsed.port || (parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "");
+    const effectivePort =
+      parsed.port || (parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "");
     if (effectivePort !== expectedPort) return false;
   }
 
   const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
   const pathname = parsed.pathname.toLowerCase();
   return matchHost(hostname, hostPattern) && matchPath(pathname, pathPattern);
+}
+
+/**
+ * Kiểm tra an toàn URL trước khi navigate:
+ * - chỉ cho phép http/https (hoặc data: khi bật cấu hình), chặn file://, chrome://, javascript:
+ * - chặn loopback/mạng nội bộ (SSRF)
+ * - kiểm tra allowed_domains (nếu được khai báo)
+ */
+export function validateNavigateUrl(
+  rawUrl: string,
+  options: { allowPrivateNetwork?: boolean; allowDataUrls?: boolean; allowedDomains?: string[] } = {},
+): { ok: true } | { ok: false; reason: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: `URL không hợp lệ: "${rawUrl}"` };
+  }
+  if (parsed.protocol === "data:") {
+    if (options.allowDataUrls) return { ok: true };
+    return { ok: false, reason: "giao thức data: bị chặn theo mặc định" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return {
+      ok: false,
+      reason: `giao thức "${parsed.protocol}" bị chặn (chỉ cho phép http: hoặc https:)`,
+    };
+  }
+  if (!options.allowPrivateNetwork && isPrivateOrLoopbackHost(parsed.hostname)) {
+    return {
+      ok: false,
+      reason: `địa chỉ nội bộ/loopback "${parsed.hostname}" bị chặn bởi chính sách chống SSRF`,
+    };
+  }
+  if (options.allowedDomains && options.allowedDomains.length > 0) {
+    const matched = options.allowedDomains.some((pat) => matchSingleRule(parsed, pat));
+    if (!matched) {
+      return {
+        ok: false,
+        reason: `domain "${parsed.hostname}" không nằm trong allowed_domains`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /** Trả về backend theo rule đầu tiên khớp domain (+ path nếu có); undefined nếu không khớp. */
